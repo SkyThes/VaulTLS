@@ -1,4 +1,5 @@
 use std::{cmp, env};
+use std::net::IpAddr;
 use anyhow::anyhow;
 use anyhow::Result;
 use openssl::asn1::{Asn1Integer, Asn1Time};
@@ -95,9 +96,22 @@ impl TLSCertificateBuilder {
         Ok(self)
     }
 
-    pub fn set_dns_san(mut self, dns_names: &Vec<String>) -> Result<Self> {
-        for dns in dns_names {
-            self.params.subject_alt_names.push(SanType::DnsName(Ia5String::try_from(dns.clone())?));
+    /// Add Subject Alternative Names for a TLS server certificate.
+    ///
+    /// Every entry is auto-detected: if it parses as an IPv4/IPv6 address
+    /// (optionally wrapped in `[]`), it becomes an `iPAddress` SAN, otherwise a
+    /// `dNSName` SAN. Blank entries are ignored.
+    pub fn set_dns_san(mut self, san_entries: &Vec<String>) -> Result<Self> {
+        for entry in san_entries {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let san = match parse_san_ip(entry) {
+                Some(ip) => SanType::IpAddress(ip),
+                None => SanType::DnsName(Ia5String::try_from(entry.to_string())?),
+            };
+            self.params.subject_alt_names.push(san);
         }
         Ok(self)
     }
@@ -254,8 +268,11 @@ pub fn issue_cert_from_csr(
 
     if !dns_names.is_empty() {
         let mut san_builder = OpensslSubjectAlternativeName::new();
-        for dns in dns_names {
-            san_builder.dns(dns);
+        for entry in dns_names {
+            match parse_san_ip(entry) {
+                Some(ip) => san_builder.ip(&ip.to_string()),
+                None => san_builder.dns(entry),
+            };
         }
         let san = san_builder.build(&x509.x509v3_context(None, None))?;
         x509.append_extension(san)?;
@@ -351,23 +368,52 @@ pub(crate) fn extract_pkcs12_serial_number(pkcs12: &[u8], password: &str) -> Res
     Ok(inner.serial_number().to_bn()?.to_vec())
 }
 
-/// Extract DNS names stored in X509 certificate
+/// Parse a SAN entry as an IP address. Accepts IPv4, IPv6 and bracketed IPv6 (`[::1]`).
+/// Returns `None` if the entry is not an IP address (i.e. it should be treated as a DNS name).
+pub(crate) fn parse_san_ip(entry: &str) -> Option<IpAddr> {
+    let entry = entry.trim();
+    let entry = entry
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(entry);
+    entry.parse::<IpAddr>().ok()
+}
+
+/// Collect the DNS and IP address SAN entries of an X509 certificate as strings.
+fn san_entries(x509: &X509) -> Vec<String> {
+    let Some(san) = x509.subject_alt_names() else { return vec![] };
+    san.iter()
+        .filter_map(|name| {
+            if let Some(dns) = name.dnsname() {
+                Some(dns.to_string())
+            } else {
+                name.ipaddress().and_then(|bytes| match bytes.len() {
+                    4 => <[u8; 4]>::try_from(bytes).ok().map(|b| IpAddr::from(b).to_string()),
+                    16 => <[u8; 16]>::try_from(bytes).ok().map(|b| IpAddr::from(b).to_string()),
+                    _ => None,
+                })
+            }
+        })
+        .collect()
+}
+
+/// Extract the DNS names and IP addresses stored in the SAN of an X509 certificate.
+/// (The name is kept for compatibility; IP SAN entries are returned as well so a renewal keeps them.)
 pub(crate) fn get_dns_names(cert: &Certificate) -> Result<Vec<String>, anyhow::Error> {
     match &cert.data {
         CertData::Pem(bytes) => {
             let x509 = X509::from_pem(bytes)?;
-            let Some(san) = x509.subject_alt_names() else { return Ok(vec![]) };
-            Ok(san.iter().filter_map(|name| name.dnsname().map(|s| s.to_string())).collect())
+            Ok(san_entries(&x509))
         }
         CertData::Pkcs12(bytes) => {
             let encrypted_p12 = Pkcs12::from_der(bytes)?;
             let Some(inner) = encrypted_p12.parse2(&cert.password)?.cert else {
                 return Err(anyhow!("No certificate found in PKCS#12"));
             };
-            let Some(san) = inner.subject_alt_names() else {
+            if inner.subject_alt_names().is_none() {
                 return Err(anyhow!("No SAN found in PKCS#12 certificate"));
-            };
-            Ok(san.iter().filter_map(|name| name.dnsname().map(|s| s.to_string())).collect())
+            }
+            Ok(san_entries(&inner))
         }
         CertData::SshBundle(_) => Ok(vec![]),
     }
@@ -444,4 +490,86 @@ fn asn1_time_to_unix(time: &openssl::asn1::Asn1TimeRef) -> Result<i64> {
     let epoch = Asn1Time::from_unix(0)?;
     let diff = epoch.diff(time)?;
     Ok((diff.days as i64 * 24 * 3600 + diff.secs as i64) * 1000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_san_ip_detects_addresses() {
+        assert_eq!(parse_san_ip("192.168.1.1"), Some("192.168.1.1".parse().unwrap()));
+        assert_eq!(parse_san_ip(" 10.0.0.1 "), Some("10.0.0.1".parse().unwrap()));
+        assert_eq!(parse_san_ip("2001:db8::1"), Some("2001:db8::1".parse().unwrap()));
+        assert_eq!(parse_san_ip("[::1]"), Some("::1".parse().unwrap()));
+        assert_eq!(parse_san_ip("router.home.lan"), None);
+        assert_eq!(parse_san_ip("999.1.1.1"), None);
+        assert_eq!(parse_san_ip("1.2.3"), None);
+    }
+
+    fn test_ca() -> CA {
+        TLSCertificateBuilder::new().unwrap()
+            .set_name(Name { cn: "Test CA".to_string(), ou: None }).unwrap()
+            .set_valid_until(1, TimespanUnit::Year).unwrap()
+            .build_ca().unwrap()
+    }
+
+    #[test]
+    fn server_cert_contains_dns_and_ip_sans() {
+        let ca = test_ca();
+        let entries = vec![
+            "router.home.lan".to_string(),
+            "192.168.1.1".to_string(),
+            "[2001:db8::1]".to_string(),
+            "   ".to_string(),
+        ];
+        let cert = TLSCertificateBuilder::new().unwrap()
+            .set_name(Name { cn: "router.home.lan".to_string(), ou: None }).unwrap()
+            .set_valid_until(1, TimespanUnit::Year).unwrap()
+            .set_ca(&ca).unwrap()
+            .set_user_id(1).unwrap()
+            .set_dns_san(&entries).unwrap()
+            .build_server().unwrap();
+
+        let CertData::Pkcs12(ref der) = cert.data else { panic!("expected PKCS#12") };
+        let p12 = Pkcs12::from_der(der).unwrap().parse2("").unwrap();
+        let x509 = p12.cert.unwrap();
+        let san = x509.subject_alt_names().unwrap();
+
+        let dns: Vec<_> = san.iter().filter_map(|n| n.dnsname().map(str::to_string)).collect();
+        assert_eq!(dns, vec!["router.home.lan".to_string()]);
+
+        let ips: Vec<_> = san.iter().filter_map(|n| n.ipaddress().map(|b| b.to_vec())).collect();
+        assert_eq!(ips.len(), 2);
+        assert!(ips.contains(&vec![192, 168, 1, 1]));
+        assert!(ips.contains(&"2001:db8::1".parse::<std::net::Ipv6Addr>().unwrap().octets().to_vec()));
+
+        // Renewal path: the IP SANs must survive get_dns_names -> set_dns_san
+        let extracted = get_dns_names(&cert).unwrap();
+        assert_eq!(extracted.len(), 3);
+        assert!(extracted.contains(&"router.home.lan".to_string()));
+        assert!(extracted.contains(&"192.168.1.1".to_string()));
+        assert!(extracted.contains(&"2001:db8::1".to_string()));
+    }
+
+    #[test]
+    fn csr_issuance_supports_ip_sans() {
+        let ca = test_ca();
+        let key = PKey::from_ec_key(
+            openssl::ec::EcKey::generate(
+                &openssl::ec::EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap()
+            ).unwrap()
+        ).unwrap();
+        let mut req = openssl::x509::X509ReqBuilder::new().unwrap();
+        req.set_pubkey(&key).unwrap();
+        req.sign(&key, MessageDigest::sha256()).unwrap();
+        let csr_der = req.build().to_der().unwrap();
+
+        let names = vec!["nas.home.lan".to_string(), "10.1.2.3".to_string()];
+        let (cert_pem, _, _) = issue_cert_from_csr(&csr_der, &ca, 30, &names).unwrap();
+        let x509 = X509::from_pem(&cert_pem).unwrap();
+        let san = x509.subject_alt_names().unwrap();
+        assert!(san.iter().any(|n| n.dnsname() == Some("nas.home.lan")));
+        assert!(san.iter().any(|n| n.ipaddress() == Some(&[10, 1, 2, 3][..])));
+    }
 }

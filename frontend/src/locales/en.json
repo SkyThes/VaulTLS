@@ -88,7 +88,7 @@
       "tlsServer": "TLS Server",
       "sshClient": "SSH Client",
       "sshServer": "SSH Server",
-      "dnsNames": "DNS Names",
+      "dnsNames": "DNS Names / IP Addresses",
       "principals": "Principals",
       "usagePlaceholder": "Usage {n}",
       "user": "User",
