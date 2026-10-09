@@ -113,7 +113,7 @@ Passwords are stored in the database and retrieved from the web interface only w
 
 ### TLS Server Certificates
 VaulTLS also has support for server certificates.
-The user flow remains quite similar with the difference that SAN DNS entries can be specified.
+The user flow remains quite similar with the difference that SAN entries can be specified. Each entry is either a DNS name (e.g. `router.home.lan`) or an IP address (IPv4 or IPv6, e.g. `192.168.1.1`); IP addresses are detected automatically and added as `iPAddress` SANs.
 Download is also using a possibly password-protected PKCS#12 file.
 Since most reverse proxies require the certificate and private key to be supplied separately, the PKCS#12 file may need to be split.
 This can be done, for example, with openssl:

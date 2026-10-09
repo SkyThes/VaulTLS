@@ -79,7 +79,7 @@
       "tlsServer": "Servidor TLS",
       "sshClient": "Cliente SSH",
       "sshServer": "Servidor SSH",
-      "dnsNames": "Nombres DNS",
+      "dnsNames": "Nombres DNS / Direcciones IP",
       "principals": "Principales",
       "usagePlaceholder": "Uso {n}",
       "user": "Usuario",
